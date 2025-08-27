@@ -2,3 +2,6 @@
 dist/
 build/
 .env
+
+# Local Netlify folder
+.netlify

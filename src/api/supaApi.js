@@ -56,13 +56,11 @@ function toStorageUrl(pathLike) {
     const key = normalizeDbPath(pathLike);
     if (!key) return null;
     if (/^https?:\/\//i.test(key)) return key; // already a URL
-
     const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(key);
     return data?.publicUrl || null;
 }
 
-/** Some overlay rows have only the filename (e.g. "walnut.png").
- *  Build a best-guess path for those based on the room's base_image folder. */
+/** Build a best-guess path for overlays based on the room's base_image folder. */
 function resolveOverlayPath({ roomBaseImage, rawOverlay }) {
     if (!rawOverlay) return null;
     // If it already has a folder or is a full URL, just use it.
@@ -73,6 +71,35 @@ function resolveOverlayPath({ roomBaseImage, rawOverlay }) {
     const baseDir = dirname(normalizeDbPath(roomBaseImage));
     if (!baseDir) return null;
     return joinPath(baseDir, rawOverlay);
+}
+
+/** Derive *1 filename variant for URLs or storage paths.
+ *  e.g. ".../walnut.png?x=y" -> ".../walnut1.png?x=y"
+ *       ".../base.jpg" -> ".../base1.jpg"
+ */
+function derive1Variant(urlOrPath) {
+    if (!urlOrPath) return "";
+
+    const qIndex = urlOrPath.indexOf("?");
+    const noQS = qIndex >= 0 ? urlOrPath.slice(0, qIndex) : urlOrPath;
+    const qs = qIndex >= 0 ? urlOrPath.slice(qIndex) : "";
+
+    const lastSlash = noQS.lastIndexOf("/");
+    const lastDot = noQS.lastIndexOf(".");
+    const dir = lastSlash >= 0 ? noQS.slice(0, lastSlash + 1) : "";
+    const name = noQS.slice(lastSlash + 1, lastDot >= 0 ? lastDot : undefined);
+    const ext = lastDot >= 0 ? noQS.slice(lastDot) : "";
+
+    // If the name is exactly "base" we want "base1"
+    // Otherwise replace the first 'base' token, else append '1'
+    const newName =
+        name === "base"
+            ? "base1"
+            : /(^|[^a-z])base($|[^0-9a-z])/i.test(name)
+                ? name.replace(/base/i, "base1")
+                : name + "1";
+
+    return dir + newName + ext + qs;
 }
 
 /* ───────────────────────────── auth (admin) ───────────────────────────── */
@@ -170,12 +197,19 @@ export async function fetchBuildRooms(buildId) {
     // build output
     const out = rooms.map((r) => {
         const baseImageUrl = toStorageUrl(r.base_image);
+        const base1Url = baseImageUrl ? derive1Variant(baseImageUrl) : null;
 
         return {
             id: r.id,
             domain: r.domain, // "Exterior" | "Interior"
             type: r.type,     // "Front" | "Kitchen" | "Bedroom" | "Bathroom"
+            // backward-compat for existing UI
             baseImage: baseImageUrl,
+            // explicit variants for desktop/mobile consumers
+            images: {
+                base: baseImageUrl,
+                base1: base1Url,
+            },
             properties: (propsByRoom[r.id] || []).map((p) => ({
                 id: p.code,
                 name: p.name,
@@ -187,10 +221,15 @@ export async function fetchBuildRooms(buildId) {
                             roomBaseImage: r.base_image,
                             rawOverlay: v.overlay_url,
                         });
+                        const overlayPath1 = overlayPath ? derive1Variant(overlayPath) : null;
+
                         return {
                             id: v.code,
                             label: v.label,
+                            // keep original single URL for backward-compat (desktop)
                             overlayUrl: overlayPath ? toStorageUrl(overlayPath) : null,
+                            // NEW: mobile variant (derived)
+                            overlayUrl1: overlayPath1 ? toStorageUrl(overlayPath1) : null,
                             layer: typeof v.layer === "number" ? v.layer : 0,
                             price: Number(v.price || 0),
                             opacity: v.opacity,
@@ -203,7 +242,6 @@ export async function fetchBuildRooms(buildId) {
     });
 
     // Preferred UI order:
-    // Exterior • Front → Interior • Kitchen → Interior • Bedroom → Interior • Bathroom → rest
     const rank = (room) => {
         const { domain, type } = room;
         if (domain === "Exterior" && type === "Front") return 0;
@@ -243,7 +281,6 @@ export async function upsertLead({ email, phone, firstName, lastName }) {
 
     // If we hit duplicate phone (23505 on "leads_phone_key"), resolve by phone
     if (res.error && res.error.code === "23505" && /leads_phone_key/i.test(res.error.message || "")) {
-        // fetch by phone
         const byPhone = await supabase
             .from("leads")
             .select("id")
@@ -260,7 +297,6 @@ export async function upsertLead({ email, phone, firstName, lastName }) {
             if (upd.error) throw upd.error;
             return upd.data;
         }
-        // If not found by phone (should be rare), rethrow original error
         throw res.error;
     }
 
@@ -282,7 +318,6 @@ export async function createQuote({ buildId, leadId, selections, pricing }) {
     });
 
     if (!rpc.error && rpc.data) {
-        // Edge function email can be fire-and-forget
         try {
             await supabase.functions.invoke("email-quote", {
                 body: { quoteId: rpc.data, leadId, buildId, pricing },
